@@ -1819,6 +1819,7 @@ async function handleClaudeStreamRequest(
   req,
   res,
   accountId,
+  accountType,
   requestedModel
 ) {
   logger.info(`🌊 Processing OpenAI stream request for model: ${requestedModel}`)
@@ -1843,34 +1844,52 @@ async function handleClaudeStreamRequest(
   // 获取该账号存储的 Claude Code headers
   const claudeCodeHeaders = await claudeCodeHeadersService.getAccountHeaders(accountId)
 
-  // 使用转换后的响应流
-  await claudeRelayService.relayStreamRequestWithUsageCapture(
-    claudeRequest,
-    apiKeyData,
-    res,
-    claudeCodeHeaders,
-    (usage) => {
-      // 记录使用统计
-      if (usage && usage.input_tokens !== undefined && usage.output_tokens !== undefined) {
-        const model = usage.model || claudeRequest.model
+  const resolvedAccountType = accountType || 'claude-official'
+  const usageCallback = (usage) => {
+    // 记录使用统计
+    if (usage && usage.input_tokens !== undefined && usage.output_tokens !== undefined) {
+      const model = usage.model || claudeRequest.model
+      const usageAccountId = usage.accountId || accountId
 
-        apiKeyService
-          .recordUsageWithDetails(apiKeyData.id, usage, model, accountId)
-          .catch((error) => {
-            logger.error('❌ Failed to record usage:', error)
-          })
-      }
-    },
-    // 流转换器：将 Claude SSE 转换为 OpenAI SSE
-    (() => {
-      const sessionId = `chatcmpl-${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`
-      return (chunk) => openaiToClaude.convertStreamChunk(chunk, requestedModel, sessionId)
-    })(),
-    {
-      betaHeader:
-        'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14'
+      apiKeyService
+        .recordUsageWithDetails(apiKeyData.id, usage, model, usageAccountId, resolvedAccountType)
+        .catch((error) => {
+          logger.error('❌ Failed to record usage:', error)
+        })
     }
-  )
+  }
+
+  // 流转换器：将 Claude SSE 转换为 OpenAI SSE
+  const streamTransformer = (() => {
+    const sessionId = `chatcmpl-${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`
+    return (chunk) => openaiToClaude.convertStreamChunk(chunk, requestedModel, sessionId)
+  })()
+
+  if (resolvedAccountType === 'claude-console') {
+    await claudeConsoleRelayService.relayStreamRequestWithUsageCapture(
+      claudeRequest,
+      apiKeyData,
+      res,
+      claudeCodeHeaders,
+      usageCallback,
+      accountId,
+      streamTransformer
+    )
+  } else {
+    // 使用转换后的响应流（官方 Claude）
+    await claudeRelayService.relayStreamRequestWithUsageCapture(
+      claudeRequest,
+      apiKeyData,
+      res,
+      claudeCodeHeaders,
+      usageCallback,
+      streamTransformer,
+      {
+        betaHeader:
+          'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14'
+      }
+    )
+  }
 
   return { abortController }
 }
@@ -1882,6 +1901,7 @@ async function handleClaudeNonStreamRequest(
   req,
   res,
   accountId,
+  accountType,
   requestedModel
 ) {
   logger.info(`📄 Processing OpenAI non-stream request for model: ${requestedModel}`)
@@ -1889,15 +1909,27 @@ async function handleClaudeNonStreamRequest(
   // 获取该账号存储的 Claude Code headers
   const claudeCodeHeaders = await claudeCodeHeadersService.getAccountHeaders(accountId)
 
+  const resolvedAccountType = accountType || 'claude-official'
+
   // 发送请求到 Claude
-  const claudeResponse = await claudeRelayService.relayRequest(
-    claudeRequest,
-    apiKeyData,
-    req,
-    res,
-    claudeCodeHeaders,
-    { betaHeader: 'oauth-2025-04-20' }
-  )
+  const claudeResponse =
+    resolvedAccountType === 'claude-console'
+      ? await claudeConsoleRelayService.relayRequest(
+          claudeRequest,
+          apiKeyData,
+          req,
+          res,
+          claudeCodeHeaders,
+          accountId
+        )
+      : await claudeRelayService.relayRequest(
+          claudeRequest,
+          apiKeyData,
+          req,
+          res,
+          claudeCodeHeaders,
+          { betaHeader: 'oauth-2025-04-20' }
+        )
 
   // 解析 Claude 响应
   let claudeData
@@ -1942,7 +1974,13 @@ async function handleClaudeNonStreamRequest(
   if (claudeData.usage) {
     const { usage } = claudeData
     apiKeyService
-      .recordUsageWithDetails(apiKeyData.id, usage, claudeRequest.model, accountId)
+      .recordUsageWithDetails(
+        apiKeyData.id,
+        usage,
+        claudeRequest.model,
+        accountId,
+        resolvedAccountType
+      )
       .catch((error) => {
         logger.error('❌ Failed to record usage:', error)
       })
@@ -1978,7 +2016,7 @@ async function handleClaudeBackend(req, res, apiKeyData, requestedModel) {
     sessionHash,
     claudeRequest.model
   )
-  const { accountId } = accountSelection
+  const { accountId, accountType } = accountSelection
 
   // 处理流式或非流式请求
   if (claudeRequest.stream) {
@@ -1988,6 +2026,7 @@ async function handleClaudeBackend(req, res, apiKeyData, requestedModel) {
       req,
       res,
       accountId,
+      accountType,
       requestedModel
     )
     return { abortController }
@@ -1998,6 +2037,7 @@ async function handleClaudeBackend(req, res, apiKeyData, requestedModel) {
       req,
       res,
       accountId,
+      accountType,
       requestedModel
     )
 
